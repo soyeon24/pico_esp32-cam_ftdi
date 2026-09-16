@@ -328,6 +328,57 @@ its own without four panels and twenty keys in the way. It switches the preview
 stream on at startup and off again on exit, and borrows viewer.py's frame
 parser rather than keeping a second copy of it.
 
+### Thermal pose
+
+```bash
+uv run tools/thermal_pose.py COM5
+```
+
+[tools/thermal_pose.py](tools/thermal_pose.py) is the laptop-webcam
+`thermal-pose` with the webcam taken out and this camera put in. The pose model,
+the false-colour palettes and the keys are all unchanged; `EspCamera` presents
+the preview stream through `cv2.VideoCapture`'s `read()`/`release()`, so nothing
+above it knows the frame came off a UART.
+
+MediaPipe is the one new dependency, and `uv run` installs it from the PEP 723
+block. The landmarker model is not in the repo — `tools/pose_landmarker_full.task`
+by default, or `--model`; the URLs are in `MODEL_URLS` at the top of the file.
+
+Three things change because the camera did, and all three are visible:
+
+* **About 5 fps, and it is the wire.** One preview frame is 19,212 bytes, which
+  is ~208 ms at 921600 — more than the pose model spends on it. On the webcam
+  the inference was the bottleneck; here it is not, so there is nothing to win
+  by dropping to the `lite` model.
+* **`read()` blocks for a frame it has not already returned.** Handing the same
+  array back would spend a whole inference re-deriving landmarks that cannot
+  have moved, and VIDEO mode would log it as a second sighting of a motionless
+  subject. Four fifths of the wall clock is spent inside that wait, so it pumps
+  HighGUI while it waits or the window stops repainting and keys pressed
+  between frames are lost.
+* **The low-res sensor look stopped being a simulation.** 160x120 is the real
+  resolution, so `--cell` defaults to `--scale` and the "sensor pixels" land on
+  the camera's own. The grid starts off for the same reason — there is nothing
+  left to imitate — and is still on `g`.
+
+Frames are upscaled by `--scale` (5 by default, so 800x600) *before* the model
+sees them. That adds no information; it keeps the landmarker's internal crop
+from being mostly interpolation noise.
+
+One key is new. `x` toggles the ESP32's AEC/AGC, because the sketch exposes once
+at boot and freezes there — background subtraction cannot survive a live
+exposure loop, and no background model is in use here. A frozen exposure from an
+hour ago is the usual reason a person comes out as a silhouette or a white
+smear; the HUD carries `min/mean/max/spread` so you can see it happening.
+
+`x` is not free, though: the sketch's `x` handler calls `bg_reset()`, so the
+background model is thrown away and re-seeded 60 frames later from whatever is
+in shot — and whoever pressed the key is usually sitting right in it. That is
+the failure `b<n>` exists for, so press `b8` from
+[tools/viewer.py](tools/viewer.py) and step out before trusting the 54x42 field
+again. Toggling `x` back off locks the exposure wherever the loop had drifted
+to, not where it started.
+
 ## Other design notes
 
 * **Backpressure comes from leaving bytes in the CDC FIFO.** The USB→UART path
