@@ -29,8 +29,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-
-import numpy as np
+from math import isfinite
 
 # docs/agent-briefing.md C1 - ToF 는 VL53L9CX (54x42 zone).
 ZONE_COLS, ZONE_ROWS = 54, 42
@@ -139,14 +138,96 @@ RECLINE_LABEL_AT = 0.55
 DROWSY_LABEL_AT = 0.50
 
 
-def _finite(depth_mm: np.ndarray) -> np.ndarray:
-    return np.where(np.isfinite(depth_mm), depth_mm, MAX_RANGE_MM)
+# ---------------------------------------------------------------- numpy 없이
+#
+# 이 파일은 **표준 라이브러리만** 쓴다. ATLAS 의 제한 Python 은 C 확장을 못 올려서
+# numpy 를 넣을 수 없고, 그 보드에서 판정을 돌리려면 순수 Python 이어야 한다.
+#
+# 원래 numpy 로 하던 일은 54x42=2268 칸짜리 격자의 단순 축약(합·중앙값·비교)뿐이라
+# 아래 몇 줄로 대체된다. 12fps 기준으로 한 프레임에 수만 번 도는 루프라 성능도 문제없다.
+
+
+def _clip(value: float, lo: float, hi: float) -> float:
+    """`np.clip` 의 스칼라판."""
+    value = float(value)
+    return lo if value < lo else hi if value > hi else value
+
+
+def _median(values) -> float:
+    """`np.median` 의 1차원판. 짝수 개면 가운데 두 값의 평균 - numpy 와 같다.
+
+    NaN 은 거르지 않는다. 호출부가 이미 걸러서 넘긴다(`np.median` 도 NaN 이 섞이면
+    NaN 을 냈으므로 거기 기대던 코드는 없다).
+    """
+    ordered = sorted(values)
+    count = len(ordered)
+    if count == 0:
+        raise ValueError("중앙값을 낼 값이 없다")
+    mid = count // 2
+    if count % 2:
+        return float(ordered[mid])
+    return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
+
+
+@dataclass
+class Grid:
+    """행 우선 1차원 리스트로 담은 2차원 격자.
+
+    거리(float)와 점유 마스크(bool)를 같은 모양으로 담는다. numpy 배열의 기능 중
+    이 파일이 실제로 쓰던 것만 있으면 되므로 인덱싱도 최소로 둔다.
+    """
+    data: list
+    rows: int
+    cols: int
+
+    @property
+    def size(self) -> int:
+        return self.rows * self.cols
+
+    def row(self, index: int) -> list:
+        start = index * self.cols
+        return self.data[start:start + self.cols]
+
+    def same_shape(self, other: "Grid | None") -> bool:
+        return other is not None and (other.rows, other.cols) == (self.rows, self.cols)
+
+
+def as_grid(obj) -> Grid:
+    """numpy 배열 · 중첩 리스트 · `Grid` 를 모두 받아 `Grid` 로 만든다.
+
+    바깥(뷰어·노드·테스트)은 여전히 numpy 배열로 `ZoneFrame` 을 만든다. 그쪽을
+    같이 바꾸면 수정 범위가 커지므로, 경계에서 한 번만 옮겨 담는다. numpy 를
+    import 하지 않고 `tolist()` 유무로 판별한다.
+    """
+    if isinstance(obj, Grid):
+        return obj
+    rows = obj.tolist() if hasattr(obj, "tolist") else obj
+    if not rows:
+        return Grid([], 0, 0)
+    if not isinstance(rows[0], (list, tuple)):
+        raise TypeError("2차원 격자가 아니다")
+    cols = len(rows[0])
+    data = []
+    for row in rows:
+        if len(row) != cols:
+            raise ValueError("행마다 길이가 다르다")
+        data.extend(row)
+    return Grid(data, len(rows), cols)
+
+
+def _finite(depth: Grid) -> Grid:
+    return Grid([v if isfinite(v) else MAX_RANGE_MM for v in depth.data],
+                depth.rows, depth.cols)
 
 
 @dataclass
 class ZoneFrame:
-    """한 프레임의 zone 거리 배열 (mm). NaN 은 무효 zone."""
-    depth_mm: np.ndarray
+    """한 프레임의 zone 거리 배열 (mm). NaN 은 무효 zone.
+
+    `depth_mm` 은 numpy 배열이어도 되고 `Grid` 여도 된다 - 판정에 들어가는 순간
+    `as_grid()` 가 한 번 옮겨 담는다.
+    """
+    depth_mm: object
 
 
 @dataclass
@@ -157,27 +238,37 @@ class BackgroundModel:
     '천천히 감쇠하는 최댓값'으로 자동 학습한다 - 사람은 zone 을 가깝게만 만든다는
     성질을 쓰지만, 오래 완전히 정지해 있으면 사람이 배경으로 흡수된다.
     """
-    ref_mm: np.ndarray | None = None
+    ref_mm: Grid | None = None
     captured: bool = False
 
-    def capture(self, frames: list[np.ndarray]) -> None:
+    def capture(self, frames: list) -> None:
         if not frames:
             raise ValueError("배경을 만들 프레임이 없다")
-        self.ref_mm = np.median(np.stack([_finite(f) for f in frames]), axis=0)
+        grids = [_finite(as_grid(f)) for f in frames]
+        rows, cols = grids[0].rows, grids[0].cols
+        # zone 마다 프레임을 가로질러 중앙값. 한두 프레임이 튀어도 배경이 안 흔들린다.
+        self.ref_mm = Grid([_median([g.data[i] for g in grids])
+                            for i in range(rows * cols)], rows, cols)
         self.captured = True
 
-    def update(self, depth_mm: np.ndarray) -> None:
+    def update(self, depth_mm) -> None:
         if self.captured:
             return
-        d = _finite(depth_mm)
-        if self.ref_mm is None or self.ref_mm.shape != d.shape:
-            self.ref_mm = np.full(d.shape, MAX_RANGE_MM, np.float64)
-        self.ref_mm = np.maximum(self.ref_mm - BG_DECAY_MM, d)
+        d = _finite(as_grid(depth_mm))
+        if not d.same_shape(self.ref_mm):
+            self.ref_mm = Grid([MAX_RANGE_MM] * d.size, d.rows, d.cols)
+        ref = self.ref_mm.data
+        self.ref_mm = Grid([max(ref[i] - BG_DECAY_MM, d.data[i]) for i in range(d.size)],
+                           d.rows, d.cols)
 
-    def occupied(self, depth_mm: np.ndarray) -> np.ndarray:
+    def occupied(self, depth_mm) -> Grid:
+        d = as_grid(depth_mm)
         if self.ref_mm is None:
-            return np.zeros(depth_mm.shape, bool)
-        return (self.ref_mm - _finite(depth_mm)) >= INTRUSION_MM
+            return Grid([False] * d.size, d.rows, d.cols)
+        far = _finite(d)
+        ref = self.ref_mm.data
+        return Grid([(ref[i] - far.data[i]) >= INTRUSION_MM for i in range(d.size)],
+                    d.rows, d.cols)
 
 
 @dataclass
@@ -206,69 +297,90 @@ class PostureVerdict:
     note: str = ""
 
 
-def find_head(occ: np.ndarray) -> tuple[int, int, int] | None:
+def find_head(occ: Grid) -> tuple[int, int, int] | None:
     """머리 행과 몸통 중심 열 구간을 찾는다. 반환: (행, 열_시작, 열_끝) 또는 None.
 
     손을 들면 그 손이 최상단 점유 행이 되어 '머리가 올라갔다'로 읽히고, 머리 거리도
     손 거리로 바뀐다. 그래서 최상단이 아니라 **폭이 충분하고 몸통 중심축 위에 있는**
     가장 높은 행을 머리로 본다.
     """
-    counts = occ.sum(axis=1)
-    if not counts.any():
+    rows, cols = occ.rows, occ.cols
+    counts = [sum(occ.row(r)) for r in range(rows)]
+    if not any(counts):
         return None
-    rows, cols = occ.shape
 
     # 몸통 = 가장 넓은 행들. 그 열 무게중심을 중심축으로 쓴다.
-    body = np.flatnonzero(counts >= max(counts.max() * 0.5, 1.0))
-    col_w = occ[body].sum(axis=0).astype(np.float64)
-    if col_w.sum() <= 0:
+    wide_enough = max(max(counts) * 0.5, 1.0)
+    col_w = [0.0] * cols
+    for r in range(rows):
+        if counts[r] < wide_enough:
+            continue
+        row = occ.row(r)
+        for c in range(cols):
+            if row[c]:
+                col_w[c] += 1.0
+    weight = sum(col_w)
+    if weight <= 0:
         return None
-    center = float(col_w @ np.arange(cols) / col_w.sum())
+    center = sum(col_w[c] * c for c in range(cols)) / weight
     half = max(TORSO_HALF_SPAN * cols, HEAD_MIN_WIDTH)
     lo, hi = int(max(center - half, 0)), int(min(center + half, cols))
 
-    band = occ[:, lo:hi].sum(axis=1)
-    cand = np.flatnonzero(band >= HEAD_MIN_WIDTH)
-    if cand.size == 0:
-        return None
-    return int(cand[0]), lo, hi
+    for r in range(rows):
+        if sum(occ.row(r)[lo:hi]) >= HEAD_MIN_WIDTH:
+            return r, lo, hi
+    return None
 
 
 def extract(frame: ZoneFrame, background: BackgroundModel,
-            prev: np.ndarray | None = None) -> tuple[PostureFeatures, np.ndarray]:
+            prev: Grid | None = None) -> tuple[PostureFeatures, Grid]:
     """zone 배열에서 기하 특징을 뽑는다. 반환: (특징, 이번 점유 마스크)."""
-    background.update(frame.depth_mm)
-    occ = background.occupied(frame.depth_mm)
-    rows, _ = occ.shape
+    depth_grid = as_grid(frame.depth_mm)
+    background.update(depth_grid)
+    occ = background.occupied(depth_grid)
+    rows, cols = occ.rows, occ.cols
     total = float(occ.size)
-    occupancy = float(occ.sum()) / total
-    depth = _finite(frame.depth_mm)
+    counts = [sum(occ.row(r)) for r in range(rows)]
+    occupancy = float(sum(counts)) / total
+    depth = _finite(depth_grid)
 
     head = find_head(occ)
-    row_any = occ.any(axis=1)
-    if head is not None and row_any.any():
+    occupied_rows = [r for r in range(rows) if counts[r]]
+    if head is not None and occupied_rows:
         top, lo, hi = head
-        bottom = int(np.flatnonzero(row_any)[-1])
+        bottom = occupied_rows[-1]
         top_row = top / (rows - 1)
         spread = max(bottom - top, 0) / (rows - 1)
-        weights = occ.sum(axis=1).astype(np.float64)
-        centroid_row = float((weights @ np.arange(rows)) / weights.sum()) / (rows - 1)
+        weight = float(sum(counts))
+        centroid_row = (sum(counts[r] * r for r in range(rows)) / weight) / (rows - 1)
         # 머리 거리 = 머리 행부터 몇 줄, 몸통 중심 열 구간 안쪽만. 들어올린 손이
         # 섞이지 않게 열도 같이 제한한다. 뒤로 젖힘을 잡는 축이라 오염되면 치명적이다.
         end = min(top + HEAD_BAND_ROWS, rows)
-        mask = occ[top:end, lo:hi]
-        vals = depth[top:end, lo:hi][mask]
+        vals = []
+        widest = 0
+        for r in range(top, end):
+            occ_row, depth_row = occ.row(r), depth.row(r)
+            in_row = 0
+            for c in range(lo, hi):
+                if occ_row[c]:
+                    vals.append(depth_row[c])
+                    in_row += 1
+            if in_row > widest:
+                widest = in_row
         # 평균이 아니라 중앙값 - 머리 바로 위로 손을 들면 팔뚝이 소수 픽셀로 섞이는데,
         # 평균은 그걸 따라가고(실측 -69mm) 중앙값은 버린다.
-        head_mm = float(np.median(vals)) if vals.size else float("nan")
-        head_w = float(mask.sum(axis=1).max()) / occ.shape[1] if mask.size else 0.0
+        head_mm = _median(vals) if vals else float("nan")
+        # 밴드가 비면(행이나 열 구간이 0폭) 0.0 - 점유가 없는 것과는 다른 경우다.
+        head_w = float(widest) / cols if (end > top and hi > lo) else 0.0
     else:
         top_row = centroid_row = spread = 1.0
         head_mm = float("nan")
         head_w = 0.0
 
-    motion = 0.0 if prev is None or prev.shape != occ.shape else \
-        float(np.logical_xor(occ, prev).sum()) / total
+    motion = 0.0
+    if occ.same_shape(prev):
+        changed = sum(1 for now, before in zip(occ.data, prev.data) if now != before)
+        motion = float(changed) / total
     return (PostureFeatures(occupancy, top_row, centroid_row, spread, head_mm,
                             motion, head_w), occ)
 
@@ -317,7 +429,7 @@ class NodDetector:
 
         if len(self._hist) >= 8:
             recent_rest = [v for ts, v in self._hist if now - ts <= REST_WINDOW_S]
-            rest = float(np.median(recent_rest or [v for _, v in self._hist]))
+            rest = _median(recent_rest or [v for _, v in self._hist])
             self.rest = rest
             # 지금 값이 아니라 최근 창에서 가장 깊었던 하강을 보여준다. 고개를 든
             # 뒤에 읽으면 0 이라, 방금 꾸벅임이 문턱에 얼마나 모자랐는지 알 수 없다.
@@ -348,7 +460,7 @@ class NodDetector:
 
         # 조용해지면 창에서 빠지길 기다리지 않고 내린다 - 깨어난 것을 바로 반영한다.
         quiet = now - self._last_event
-        fade = float(np.clip(1.0 - (quiet - NOD_QUIET_S) / NOD_FADE_S, 0.0, 1.0))
+        fade = _clip(1.0 - (quiet - NOD_QUIET_S) / NOD_FADE_S, 0.0, 1.0)
         return rate * fade
 
 
@@ -366,16 +478,16 @@ class PostureBaseline:
     def from_features(cls, feats: list[PostureFeatures]) -> "PostureBaseline":
         if not feats:
             raise ValueError("baseline 을 만들 특징이 없다")
-        med = lambda a: float(np.median([getattr(f, a) for f in feats]))
-        heads = [f.head_mm for f in feats if np.isfinite(f.head_mm)]
+        med = lambda a: _median([getattr(f, a) for f in feats])
+        heads = [f.head_mm for f in feats if isfinite(f.head_mm)]
         # 머리를 못 찾은 프레임은 head_w 가 0 이다. 기준에 섞으면 통째로 낮아진다.
         widths = [f.head_w for f in feats if f.head_w > 0]
         top = med("top_row")
         # top_row 가 0 에 붙으면 머리가 잘린 것이다. 그 baseline 을 쓰면 바른 자세도
         # '머리가 내려갔다'로 읽혀 계속 이탈로 나온다(실측: 바른자세 slump 0.37).
         return cls(top, med("spread"),
-                   float(np.median(heads)) if heads else float("nan"),
-                   float(np.median(widths)) if widths else 0.0,
+                   _median(heads) if heads else float("nan"),
+                   _median(widths) if widths else 0.0,
                    len(feats), clipped=top < BASELINE_CLIP_AT)
 
 
@@ -403,23 +515,23 @@ def judge(feats: PostureFeatures, base: PostureBaseline | None, nod_rate: float,
 
     # 1) 이탈 '크기' - 머리가 내려간 정도 + 몸이 접힌 정도. 방향 정보는 없다.
     head_drop = feats.top_row - base.top_row
-    drop = float(np.clip(head_drop / SLUMP_SPAN, 0.0, 1.0))
-    collapse = float(np.clip((base.spread - feats.spread) / max(base.spread, 1e-6), 0.0, 1.0))
-    magnitude = float(np.clip(0.8 * drop + 0.2 * collapse, 0.0, 1.0))
+    drop = _clip(head_drop / SLUMP_SPAN, 0.0, 1.0)
+    collapse = _clip((base.spread - feats.spread) / max(base.spread, 1e-6), 0.0, 1.0)
+    magnitude = _clip(0.8 * drop + 0.2 * collapse, 0.0, 1.0)
 
     # 2) 젖힘은 '멀어진 거리' 자체가 고유 축이다. 머리 높이에 곱하면 안 된다 -
     #    머리를 안 내리고 젖히는 경우가 0 으로 사라진다.
     # 거리는 화면과 로그에만 남긴다. 방향은 머리 폭이 가른다 - 의자가 실루엣에
     # 섞이면 몸통 폭에서 나온 거리는 부호까지 뒤집힌다.
     dist_delta = (dist_mm - base.head_mm
-                  if np.isfinite(dist_mm) and np.isfinite(base.head_mm) else 0.0)
-    if np.isfinite(dist_mm) and np.isfinite(base.head_mm) and base.head_mm > 0.0:
+                  if isfinite(dist_mm) and isfinite(base.head_mm) else 0.0)
+    if isfinite(dist_mm) and isfinite(base.head_mm) and base.head_mm > 0.0:
         rel = (dist_mm - base.head_mm) / base.head_mm
-        recline_raw = float(np.clip((rel - RECLINE_REL_DEADBAND) / RECLINE_REL_SPAN, 0.0, 1.0))
+        recline_raw = _clip((rel - RECLINE_REL_DEADBAND) / RECLINE_REL_SPAN, 0.0, 1.0)
     else:
         rel, recline_raw = 0.0, 0.0
     # 지속 조건을 못 채운 젖힘은 꾸벅임의 흔들림일 뿐이다.
-    recline = recline_raw * float(np.clip(recline_held_s / RECLINE_HOLD_S, 0.0, 1.0))
+    recline = recline_raw * _clip(recline_held_s / RECLINE_HOLD_S, 0.0, 1.0)
 
     # 3) 엎드림은 머리 높이로 재되, 멀어지고 있으면 눌러 끈다. 2D 에선 젖혀도 머리가
     #    내려가므로, 이 게이트가 없으면 젖힘이 전부 엎드림으로 빨려 들어간다.
@@ -427,21 +539,21 @@ def judge(feats: PostureFeatures, base: PostureBaseline | None, nod_rate: float,
     #    지속 조건까지 걸면 젖히는 3초 동안 엎드림이 먼저 문턱을 넘는다.
     slump_raw = magnitude * (1.0 - recline_raw)
     # 지속 시간이 안 찼으면 아직 엎드림이 아니다 - 꾸벅임의 하강 국면과 구분되는 지점.
-    slump = slump_raw * float(np.clip(slump_held_s / SLUMP_HOLD_S, 0.0, 1.0))
+    slump = slump_raw * _clip(slump_held_s / SLUMP_HOLD_S, 0.0, 1.0)
 
     # dist_mm 은 바 없이 숫자로만 보여준다 - 지금 판정의 근거를 눈으로 확인하는 값.
     # 4) 졸음 - 꾸벅임 빈도. 자세가 아니라 시간 패턴이라 별도 축이다.
-    drowsy = float(np.clip(nod_rate / NOD_RATE_FULL, 0.0, 1.0))
+    drowsy = _clip(nod_rate / NOD_RATE_FULL, 0.0, 1.0)
 
     parts = {"slump": slump, "recline": recline, "drowsy": drowsy,
              "dist_mm": dist_delta, "slump_raw": slump_raw, "recline_raw": recline_raw,
              "headw_ratio": (width / base.head_w) if base.head_w > 0 else 0.0,
              "dist_rel": (dist_mm / base.head_mm - 1.0)
-                         if np.isfinite(dist_mm) and base.head_mm > 0 else 0.0}
+                         if isfinite(dist_mm) and base.head_mm > 0 else 0.0}
     # 뒤로 젖힘은 자세 불량이지만 각성 상태일 수 있어 피로 기여를 낮게 잡는다.
-    delta = float(np.clip(max(0.95 * slump, 0.85 * drowsy, 0.45 * recline), 0.0, 1.0))
-    stability = 1.0 - float(np.clip(feats.motion / MOTION_SPAN, 0.0, 1.0))
-    phi = float(np.clip((1.0 - delta) * stability, 0.0, 1.0))
+    delta = _clip(max(0.95 * slump, 0.85 * drowsy, 0.45 * recline), 0.0, 1.0)
+    stability = 1.0 - _clip(feats.motion / MOTION_SPAN, 0.0, 1.0)
+    phi = _clip((1.0 - delta) * stability, 0.0, 1.0)
 
     # 젖힘을 먼저 본다. 반대로 두면 slump 가 먼저 문턱을 넘어 젖힘이 영영 안 뜬다
     # (실측에서 recline 1.0 인데도 라벨이 SLUMP 로 나왔던 버그).
@@ -470,9 +582,9 @@ class PostureTracker:
     background: BackgroundModel = field(default_factory=BackgroundModel)
     baseline: PostureBaseline | None = None
     nods: NodDetector = field(default_factory=NodDetector)
-    _prev: np.ndarray | None = field(default=None, repr=False)
+    _prev: Grid | None = field(default=None, repr=False)
     _posture_buf: list[PostureFeatures] = field(default_factory=list, repr=False)
-    _bg_buf: list[np.ndarray] = field(default_factory=list, repr=False)
+    _bg_buf: list = field(default_factory=list, repr=False)
     _head_hist: deque = field(default_factory=deque, repr=False)
     _width_hist: deque = field(default_factory=deque, repr=False)
     _want_posture: int = 0
@@ -514,16 +626,16 @@ class PostureTracker:
             self._head_hist.clear()
             self._width_hist.clear()
         else:
-            if np.isfinite(feats.head_mm):
+            if isfinite(feats.head_mm):
                 self._head_hist.append((now, feats.head_mm))
             if feats.head_w > 0.0:
                 self._width_hist.append((now, feats.head_w))
         for h in (self._head_hist, self._width_hist):
             while h and now - h[0][0] > DIST_SMOOTH_S:
                 h.popleft()
-        head_mm = (float(np.median([v for _, v in self._head_hist]))
+        head_mm = (_median([v for _, v in self._head_hist])
                    if self._head_hist else float("nan"))
-        head_w = (float(np.median([v for _, v in self._width_hist]))
+        head_w = (_median([v for _, v in self._width_hist])
                   if self._width_hist else 0.0)
 
         if self._want_posture > 0:
