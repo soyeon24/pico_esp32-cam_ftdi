@@ -390,6 +390,22 @@ uv run tools/posture_viewer.py --source esp --port COM5
 uv run tools/test_posture.py                     # synthetic check, no board
 ```
 
+### On a Raspberry Pi
+
+[pi/](pi/) runs the same judgement headless on a Pi 4 and publishes it - MQTT
+for the hub, HTTP for the Pi 5 display. It imports `tools/posture.py` rather
+than copying it, so the thresholds below are the ones it uses.
+
+```bash
+python -m deskmate_posture --broker <hub-ip>     # from pi/, port auto-detected
+python pi/test_node.py                           # no board, no pyserial
+```
+
+There is no keyboard on a Pi, so the two calibration steps below run on a timer
+and can be re-armed with `POST /api/calibrate`. [pi/README.md](pi/README.md)
+covers the wire contracts and the one place it deliberately differs from the
+viewer.
+
 ### Calibration is two layers, in order
 
 Press SPACE and the viewer counts eight seconds for you to get out of shot,

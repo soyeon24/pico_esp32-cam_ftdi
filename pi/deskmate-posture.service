@@ -1,0 +1,37 @@
+[Unit]
+Description=DESKMATE posture node (ESP32-CAM via RP2040 bridge)
+Documentation=file:/opt/deskmate/pico_esp32-cam_ftdi/pi/README.md
+# 브로커가 늦게 떠도 노드는 판정을 계속한다. 그래도 부팅 순서에서 굳이 앞설
+# 이유가 없어 네트워크는 기다린다.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deskmate
+# /dev/ttyACM* 는 dialout 소유다. root 로 돌릴 이유가 없다.
+SupplementaryGroups=dialout
+WorkingDirectory=/opt/deskmate/pico_esp32-cam_ftdi/pi
+Environment=PYTHONUNBUFFERED=1
+# --port 를 안 준다. Pi 는 부팅마다 ttyACM 번호가 바뀔 수 있어서 인터페이스
+# 이름(Vision Stream)으로 찾는 편이 안전하다.
+ExecStart=/opt/deskmate/venv/bin/python -m deskmate_posture \
+    --broker 127.0.0.1 \
+    --node posture-cam \
+    --host 0.0.0.0 --port-http 8765
+
+# 링크가 끊기면 프로세스가 1 로 죽는다. 포트가 사라졌다 다시 나타나면 ttyACM
+# 번호가 바뀌므로 재연결보다 재시작이 경로가 하나뿐이라 낫다.
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# --log 를 쓸 때 쓸 수 있는 유일한 쓰기 경로. systemd 가 /var/lib/deskmate 를 만들고
+# 권한을 맞춰 준다. 존재하지 않는 경로를 ReadWritePaths 에 적으면 유닛이 아예 안 뜬다.
+StateDirectory=deskmate
+
+[Install]
+WantedBy=multi-user.target
