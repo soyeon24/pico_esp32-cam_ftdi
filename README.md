@@ -6,6 +6,37 @@ follows the host's baud rate, and reproduces the DTR/RTS reset circuit esptool
 expects — so `esptool` and the Arduino IDE flash the ESP32 with no buttons
 pressed and no IO0 jumper.
 
+## Quick start
+
+Two boards to flash and one command to run. [firmware/](firmware/) holds both
+images already built, so none of the toolchains below are needed to try it -
+see [firmware/README.md](firmware/README.md) for the wiring and the order.
+
+```bash
+# RP2040: hold BOOT, plug in, copy firmware/pico_esp32-cam_ftdi.uf2 to RPI-RP2
+# ESP32:  jumper GP3-GND, press its RST, then
+esptool --chip esp32 --port COM6 --baud 460800 write-flash -z \
+  0x1000 firmware/bootloader.bin 0x8000 firmware/partitions.bin \
+  0xe000 firmware/boot_app0.bin 0x10000 firmware/firmware.bin
+# then remove the jumper and press RST again - IO0 is the camera's XCLK
+
+uv run tools/posture_viewer.py --source esp        # lists the ports
+uv run tools/posture_viewer.py --source esp --port COM7
+```
+
+Two COM ports appear. The one to give the viewer is **Vision Stream**,
+interface 2; interface 0 is the bridge esptool talks to. Running without
+`--port` prints both and says which is which.
+
+Then: SPACE and step out of shot, sit upright and press SPACE again, and it
+judges. [The posture section](#posture) covers what the panel is showing and
+what to do when the numbers look wrong.
+
+Without `uv`: `pip install pyserial numpy opencv-python` and run
+`tools/posture_viewer.py` with any Python 3.10+.
+
+## The bridge
+
 The UART is on PIO, not either hardware UART, so **all four signal pins are
 free choices**: edit the defines at the top of
 [pico_esp32-cam_ftdi.c](pico_esp32-cam_ftdi.c) and rewire. Both hardware UARTs
@@ -203,7 +234,7 @@ cmake --build build
 ```
 
 Flash `build/pico_esp32-cam_ftdi.uf2` with BOOT held while plugging in.
-Roughly 27 KB of flash and 11 KB of RAM.
+Roughly 44 KB of flash and 68 KB of RAM - the vision stage's frame buffers are most of the latter, since `in_buf` and `out_buf` are each sized for a whole 160x120 preview.
 
 ## Use
 
@@ -315,6 +346,19 @@ straight to the sketch.
 | `/` | both | print status |
 | `q` | | quit |
 
+### Just the camera
+
+```bash
+uv run tools/camview.py COM5
+```
+
+One window, the 160x120 picture, and the numbers that say whether it is usable.
+Framing, focus and exposure are settled at the camera and no later stage can
+recover from getting them wrong, so it is worth being able to look at that on
+its own without four panels and twenty keys in the way. It switches the preview
+stream on at startup and off again on exit, and borrows viewer.py's frame
+parser rather than keeping a second copy of it.
+
 ## Other design notes
 
 * **Backpressure comes from leaving bytes in the CDC FIFO.** The USB→UART path
@@ -333,3 +377,117 @@ straight to the sketch.
   would cost PIO instructions for nothing.
 * Raw TinyUSB rather than `pico_stdio_usb`, because stdio does not expose
   DTR/RTS or the line coding — which is the entire point here.
+
+## Posture
+
+The posture stage answers "what is the person doing" as a label plus two
+scalars - `phi` (focused) and `delta` (fatigued) - for a state machine
+downstream.
+
+```bash
+uv run tools/posture_viewer.py --source camera   # webcam stand-in, no board
+uv run tools/posture_viewer.py --source esp --port COM5
+uv run tools/test_posture.py                     # synthetic check, no board
+```
+
+### On a Raspberry Pi
+
+[pi/](pi/) runs the same judgement headless on a Pi 4 and publishes it - MQTT
+for the hub, HTTP for the Pi 5 display. It imports `tools/posture.py` rather
+than copying it, so the thresholds below are the ones it uses.
+
+```bash
+python -m deskmate_posture --broker <hub-ip>     # from pi/, port auto-detected
+python pi/test_node.py                           # no board, no pyserial
+```
+
+There is no keyboard on a Pi, so the two calibration steps below run on a timer
+and can be re-armed with `POST /api/calibrate`. [pi/README.md](pi/README.md)
+covers the wire contracts and the one place it deliberately differs from the
+viewer.
+
+### Calibration is two layers, in order
+
+Press SPACE and the viewer counts eight seconds for you to get out of shot,
+then tells the *sensor* to rebuild its own background - `b`, which on the ESP32
+also re-runs AEC and locks the exposure it lands on. Only once that reports
+back does it take the zone reference the judgement compares against.
+
+The order is the whole point. The ESP32's background is what turns a picture
+into a coverage field; seed it with you still in the chair and you become part
+of the background, after which nothing downstream can find you. Pressing SPACE
+again during the countdown skips it, for when the desk is already empty.
+
+| | |
+|---|---|
+| SPACE | next step (during the countdown: capture now) |
+| `n` / `b` | redo background / redo posture baseline |
+| `1`–`4`, `0` | tag the log with a ground-truth label, stop tagging |
+| `v` | cycle the left panel: coverage / zone / mask / skeleton |
+| `c` `a` `g` | palette / contrast stretch / grid |
+| `s` / `p` | save a PNG / the camera photo window |
+| `[` `]` | threshold, 0 means Otsu picks it |
+| `o` `O` | opening iterations |
+| `h` / `i` | fill holes / invert |
+| `-` `=` | difference gain |
+| `,` `.` | exposure — the board rebuilds its background, so redo step 1 |
+| `x` | auto exposure and gain |
+| `/` | status from both boards |
+
+This is the only tool that judges. [tools/viewer.py](tools/viewer.py) stays as
+the tuning view - it draws mask and skeleton as they come off the wire and
+does no judgement at all, which is what its four plain panels are for.
+
+The left panel draws the **coverage field**, not the reconstructed distances:
+coverage is what the board actually streams and it carries a gradient, while
+the distance array is the mask pushed back through an apparent-size estimate
+and so holds two values. `v` switches to it when you want to see exactly what
+the judgement sees.
+
+The panel's link line is there because a dead link looks like a working one -
+the last frame keeps being drawn. It shows the board's own log (`# bg
+captured`, `# exposure locked`) while things are healthy, and says so when the
+mask stops arriving or the reader thread stops.
+
+### The sensor is the only swappable part
+
+[tools/posture.py](tools/posture.py) takes one thing: a 54x42 array of
+distances. Everything that differs between sensors lives in an adapter that
+produces that array, so the judgement is written once.
+
+| | |
+|---|---|
+| [tools/esp_source.py](tools/esp_source.py) | bridge frames -> distances |
+| [tools/camera_source.py](tools/camera_source.py) | a webcam through the ESP32's and vision.c's stages, for when the boards are elsewhere |
+| *(later)* | a real depth sensor, unchanged downstream |
+
+**Neither adapter has depth**, so both estimate it from apparent size: torso
+width, because shoulders keep their width through a slump and only distance
+moves them. The distances that come out are geometrically right and
+absolutely approximate - fine for telling leaning back from folding forward,
+not to be read as millimetres.
+
+### Why it is built this way
+
+**Head height cannot separate slumping from reclining.** Both drop the head in
+the image - leaning back sinks it exactly as folding forward does. So head
+height only measures *how far* from the reference posture, and the change in
+apparent size decides *which way*.
+
+**Slumping and nodding differ in time, not in shape.** At the bottom of a nod
+the geometry is a slump. Slumping is therefore defined as staying down, and
+only counts after three continuous seconds, which a nod never reaches.
+
+**Everything is relative to a captured reference posture.** That is what lets
+one set of thresholds cover different people and sitting distances - nothing is
+calibrated in pixels.
+
+### Before tuning
+
+A head touching row 0 means the frame cut it off, and a reference captured that
+way reads every later posture as "head has dropped". The panel says
+`baseline clipped` when it happens; tilt the camera down and recapture.
+
+The judgement is only as good as the mask. If `coverage` is an outline with
+nothing inside it, that is the subject matching the background in brightness,
+and no threshold recovers what was never there.

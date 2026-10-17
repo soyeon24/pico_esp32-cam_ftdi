@@ -1,0 +1,9 @@
+# Raspberry Pi 4 자세 노드.
+#
+# OpenCV 는 없다. 화면을 안 그리므로 필요 없고, Pi 에 opencv-python 을 얹는 것이
+# 이 경로에서 제일 무거운 설치였다. PC 뷰어(tools/posture_viewer.py)만 그게 필요하다.
+numpy>=1.24
+pyserial>=3.5
+
+# MQTT 발행용. --broker 를 안 쓰면 없어도 돌아간다 (/api/state 는 그대로 나간다).
+paho-mqtt>=1.6

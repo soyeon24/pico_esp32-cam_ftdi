@@ -57,7 +57,11 @@ static uint16_t crc16(const uint8_t *p, uint32_t n) {
 // ---------------------------------------------------------------- tunables
 
 static uint8_t cfg_threshold = 40;
-static uint8_t cfg_open      = 1;   /* erosions then dilations: kills speckle */
+/* 0, matching the board this was tuned on. An opening severs any connection a
+ * single cell wide, and at 54x42 a neck is about that - the head detaches into
+ * its own blob and the largest-component step then throws it away. Turn it back
+ * on with 'o' if the mask is speckled. */
+static uint8_t cfg_open      = 0;
 static uint8_t cfg_close     = 0;   /* dilations then erosions - see fill_holes */
 static bool    cfg_fill      = true;
 static bool    cfg_skeleton  = true;
@@ -114,11 +118,29 @@ static void out_drain(void) {
     if (out_pos >= out_len) out_reset();
 }
 
+/* 통째로 들어갈 자리가 날 때까지 들고 있는 한 줄.
+ *
+ * out_buf 를 거치지 않고 CDC FIFO 에 직접 쓰기 때문에, 프레임이 나가는 중에 쓰면
+ * 그 한가운데 텍스트가 끼어 호스트 쪽 CRC 가 깨진다. 그리고 FIFO 에 자리가 모자라면
+ * tud_cdc_n_write 는 들어가는 만큼만 쓰고 나머지를 버린다 - 반환값을 안 보면
+ * 상태 줄이 중간에서 잘린 채 나간다(실제로 skel=1 에서 끊겼다).
+ *
+ * 그래서 자르지도, 끼워 넣지도 않는다. 자리가 날 때까지 미룬다. */
+static char say_buf[256];
+static bool say_pending;
+
 static void say(const char *s) {
-    if (tud_cdc_n_connected(CDC_VISION)) {
-        tud_cdc_n_write(CDC_VISION, s, strlen(s));
-        tud_cdc_n_write_flush(CDC_VISION);
-    }
+    snprintf(say_buf, sizeof say_buf, "%s", s);
+    say_pending = true;
+}
+
+static void say_flush(void) {
+    if (!say_pending || out_len || !tud_cdc_n_connected(CDC_VISION)) return;
+    uint32_t n = (uint32_t)strlen(say_buf);
+    if (tud_cdc_n_write_available(CDC_VISION) < n) return;   /* 다음 기회에 */
+    tud_cdc_n_write(CDC_VISION, say_buf, n);
+    tud_cdc_n_write_flush(CDC_VISION);
+    say_pending = false;
 }
 
 // ---------------------------------------------------------------- morphology
@@ -683,8 +705,8 @@ bool vision_rx_byte(uint8_t b) {
 static void status(void) {
     char line[224];
     snprintf(line, sizeof line,
-             "\n# rp2040: t=%u open=%u fill=%u close=%u skel=%u graph=%u spur=%u"
-             " big=%u cov=%u baud=%lu joints=%u links=%u"
+             "\n# rp2040: t=%u eff=%u inv=%u open=%u fill=%u close=%u skel=%u"
+             " graph=%u spur=%u big=%u cov=%u baud=%lu joints=%u links=%u"
              " frames=%lu crcerr=%lu dropped=%lu\n",
              cfg_threshold, cfg_effective, cfg_invert, cfg_open, cfg_fill, cfg_close, cfg_skeleton,
              cfg_graph, cfg_spur, cfg_largest, cfg_coverage,
@@ -745,7 +767,14 @@ void vision_init(void) {
 }
 
 void vision_task(void) {
-    poll_commands();
-    if (!tud_cdc_n_connected(CDC_VISION)) out_reset();
-    else                                  out_drain();
+    if (!tud_cdc_n_connected(CDC_VISION)) {
+        out_reset();
+        poll_commands();        /* ESP 로 넘길 명령은 뷰어가 없어도 받는다 */
+        return;
+    }
+    out_drain();
+    /* status() 가 say() 로 텍스트를 뱉으므로, 프레임이 다 나간 뒤에만 명령을
+     * 처리한다. 그러지 않으면 '?' 가 자기 답과 함께 프레임을 하나 깨뜨린다. */
+    if (out_len == 0) poll_commands();
+    say_flush();
 }
